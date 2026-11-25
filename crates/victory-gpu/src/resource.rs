@@ -1834,7 +1834,8 @@ pub(crate) fn let_go_idle() {
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
+            // Its release (a kernel call per texture) on a thread of its own.
+            crate::host::retire(crate::host::Elsewhere::new(host));
         }
     }
     if went > 0 {

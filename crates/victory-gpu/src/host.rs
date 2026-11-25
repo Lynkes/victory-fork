@@ -224,6 +224,71 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
+/// An object whose drop happens on a thread of its own ("victory-release"),
+/// wherever this wrapper is dropped: for host objects whose release is a
+/// kernel call. The sweep's host copies of textures (`resource::let_go_idle`)
+/// were let go on the submitting thread, and each was a `DestroyAllocation`
+/// there: 22 ms a frame of the submitting thread in the profile of the
+/// seconds after the world appears, while the title streams (25/11).
+/// Wrapped in [`retire`] it still waits for the submissions running now.
+/// `VICTORY_RELEASE_THREAD=0`: dropped where the wrapper is, as before.
+pub(crate) struct Elsewhere(Option<Box<dyn std::any::Any>>);
+
+impl Elsewhere {
+    pub(crate) fn new<T: 'static>(object: T) -> Elsewhere {
+        Elsewhere(Some(Box::new(object)))
+    }
+}
+
+/// What travels to the release thread.
+struct Parcel(#[allow(dead_code)] Box<dyn std::any::Any>);
+// SAFETY: as for `Retired`: D3D12 objects (free-threaded) and the
+// reference-counted wrappers holding them, the last reference, dropped once.
+unsafe impl Send for Parcel {}
+
+/// Since the start: objects the release thread let go, and the
+/// microseconds that took it (off every thread that matters).
+pub(crate) static RELEASED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn release_thread() -> Option<&'static std::sync::mpsc::Sender<Parcel>> {
+    static SENDER: OnceLock<Option<std::sync::mpsc::Sender<Parcel>>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| {
+            if std::env::var_os("VICTORY_RELEASE_THREAD").is_some_and(|v| v == "0") {
+                return None;
+            }
+            let (send, receive) = std::sync::mpsc::channel::<Parcel>();
+            std::thread::Builder::new()
+                .name("victory-release".into())
+                .spawn(move || {
+                    // On the slow cores, where there are any: nothing waits for it.
+                    let _ = crate::framelog::keep_on_slow_cores("victory-release");
+                    for parcel in receive {
+                        let started = std::time::Instant::now();
+                        drop(parcel);
+                        RELEASED[0].fetch_add(1, Ordering::Relaxed);
+                        RELEASED[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                })
+                .ok()
+                .map(|_| send)
+        })
+        .as_ref()
+}
+
+impl Drop for Elsewhere {
+    fn drop(&mut self) {
+        let Some(object) = self.0.take() else {
+            return;
+        };
+        match release_thread() {
+            // If the thread is gone, `send` hands the parcel back: dropped here.
+            Some(send) => drop(send.send(Parcel(object))),
+            None => drop(object),
+        }
+    }
+}
+
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
     let done: Vec<(u64, Retired)> = {
@@ -8230,6 +8295,22 @@ impl Meter {
                      {lists:.1} lists, {shown:.0} slots shown, {again:.1} written again before, {left:.1} textures left to the submission",
                     busy / 1e6,
                     detiling / 1e6
+                );
+            }
+        }
+        {
+            // The release thread (`Elsewhere`): what it let go since the last
+            // line, and the kernel time that took off the submitting thread.
+            static SEEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+            let [n, us] = [0, 1].map(|i| {
+                let now = RELEASED[i].load(Ordering::Relaxed);
+                now - SEEN[i].swap(now, Ordering::Relaxed)
+            });
+            if n > 0 {
+                tracing::info!(
+                    "released on their own thread (VICTORY_RELEASE_THREAD), per frame: {:.1} host objects, {:.2} ms",
+                    n as f64 / frames,
+                    us as f64 / 1e3 / frames
                 );
             }
         }
