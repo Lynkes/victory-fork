@@ -634,7 +634,10 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    // Through `used()`, which reads the list from disk first if this process
+    // has not: a process that made pipelines without the title (the offline
+    // prebuild) wrote an empty list over the runs' one.
+    let used: Vec<String> = used().iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.

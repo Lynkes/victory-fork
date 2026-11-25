@@ -824,6 +824,40 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+/// The offline prebuild (`victory translate --warm ... --prebuild`): the
+/// host pipeline of the compute shader `container`, made as a run makes it
+/// (a compute pipeline is its shader alone: the root signature comes from
+/// the translation's bindings), so the pipeline library keeps it under the
+/// name a run looks it up by and the run loads it instead of compiling it.
+/// Graphics pipelines also hold the title's state, which only a run has.
+/// `Err` when it gets no host pipeline (it does not translate, or it is on
+/// `VICTORY_NO_HOST_PIPELINE`). The library is saved now and then.
+#[cfg(windows)]
+pub fn prebuild_compute(container: &[u8]) -> Result<(), String> {
+    begin_prebuild()?;
+    let made = host::HostPipeline::new(&[shader("compute", container)], None);
+    library::save(false);
+    made.map(drop).ok_or_else(|| "no host pipeline".to_owned())
+}
+
+/// Makes the host device and tells the translator the host's facts (its
+/// widest wave, the view heap's null slot) before a prebuild translates
+/// anything: they are part of the translation and of the shader cache's key.
+#[cfg(windows)]
+pub fn begin_prebuild() -> Result<(), String> {
+    crate::host::host().ok_or("no host D3D12 device")?;
+    crate::descriptor::host::probe_view_limit();
+    Ok(())
+}
+
+/// Host pipelines compiled by the driver and loaded from the library, in
+/// this process so far.
+#[cfg(windows)]
+pub fn library_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (library::MADE.load(Ordering::Relaxed), library::LOADED.load(Ordering::Relaxed))
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]

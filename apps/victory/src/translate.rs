@@ -219,7 +219,7 @@ fn making_note() -> String {
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
 /// translating each at its first use.
-pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()> {
+pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, prebuild: bool) -> Result<()> {
     // `--warm all`: every container found, whatever its hash.
     let all = file.as_os_str() == "all";
     let mut wanted: HashSet<String> = HashSet::new();
@@ -241,9 +241,18 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
     let threads = jobs.unwrap_or(4).max(1);
+    if prebuild {
+        // The device first: its facts are part of every translation below.
+        victory_hle::modules::d3d12x::begin_prebuild().map_err(anyhow::Error::msg)?;
+        // A fault in the driver's compiler names the pipeline it was given.
+        victory_loader::report_crashes();
+        victory_hle::modules::d3d12x::note_pipeline_crashes();
+    }
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
+    // compute shaders whose host pipeline was made / that got none
+    let built = [const { AtomicUsize::new(0) }; 2];
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
@@ -279,6 +288,10 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                                 Err(_) => 2,
                             };
                             counts[which].fetch_add(1, Ordering::Relaxed);
+                            if prebuild && which < 2 && is_compute(&bytes) {
+                                let ok = victory_hle::modules::d3d12x::prebuild_compute(&bytes).is_ok();
+                                built[usize::from(!ok)].fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     });
                 }
@@ -293,7 +306,26 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
         translated + there + failed,
         began.elapsed().as_secs_f64()
     );
+    if prebuild {
+        let (made, loaded) = victory_hle::modules::d3d12x::finish_prebuild();
+        println!(
+            "prebuild     {} compute pipelines in the library ({made} compiled now, {loaded} there already), {} got none",
+            built[0].load(Ordering::Relaxed),
+            built[1].load(Ordering::Relaxed),
+        );
+    }
     Ok(())
+}
+
+/// Whether a console container holds a compute program (its host pipeline
+/// is its shader alone, so it can be made ahead of a run).
+fn is_compute(container: &[u8]) -> bool {
+    let Ok(c) = Container::parse(container) else {
+        return false;
+    };
+    c.part(victory_shader::FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(|p| p.stage == HwStage::Cs))
 }
 
 pub fn run(

@@ -138,9 +138,14 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// run drew with it (during loading, so the world's first frames find it),
+/// or whatever it is with `VICTORY_PIPELINES_ALL_EARLY=1` (every pipeline
+/// the title creates is made while it loads, drawn with or not; more work
+/// at loading, none at a pipeline's first draw).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    static ALL: OnceLock<bool> = OnceLock::new();
+    let all = *ALL.get_or_init(|| std::env::var_os("VICTORY_PIPELINES_ALL_EARLY").is_some_and(|v| v == "1"));
+    if !p.shaders.is_empty() && (all || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
