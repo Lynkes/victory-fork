@@ -257,6 +257,30 @@ pub(crate) fn label(text: String) {
     LABEL.with(|l| *l.borrow_mut() = text);
 }
 
+/// For a crash report, run on the faulting thread: the library call it is
+/// in (a driver compile is `make`) and its pipeline's shaders, else the
+/// pipeline it last named. Never blocks: the faulting thread may hold the
+/// list or be naming a pipeline.
+pub(crate) fn crash_note() -> String {
+    let thread = crate::host::thread_id();
+    if let Ok(calls) = CALLS.try_lock() {
+        let here: Vec<String> = calls
+            .iter()
+            .filter(|c| c.0 == thread)
+            .map(|c| format!("pipeline library call on this thread: {} {}", c.1, c.2))
+            .collect();
+        if !here.is_empty() {
+            return here.join("; ");
+        }
+    }
+    LABEL
+        .try_with(|l| l.try_borrow().map(|l| l.clone()).unwrap_or_default())
+        .ok()
+        .filter(|l| !l.is_empty())
+        .map(|l| format!("the pipeline this thread last named (no library call running): {l}"))
+        .unwrap_or_default()
+}
+
 /// A library call of this thread, listed in [`CALLS`] until dropped.
 struct Call(u32, u64);
 
@@ -429,6 +453,8 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// A library the driver refused, kept as it was ([`open`]).
+const REJECTED_FILE: &str = "host-pipelines.rejected.bin";
 /// A saved library that could not replace [`LIBRARY_FILE`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
@@ -441,6 +467,14 @@ fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
+            // With RenderDoc loaded the device is RenderDoc's: the card's
+            // library is not for it, and what it would save is not for
+            // the card. Neither read nor written in such a run.
+            #[cfg(feature = "diagnostics")]
+            if crate::renderdoc::loaded() {
+                tracing::info!("RenderDoc is loaded: the host pipeline library is neither read nor saved in this run");
+                return None;
+            }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
@@ -461,6 +495,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
         }
     };
+    let mut rejected = false;
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
             Ok(library) => {
@@ -479,7 +514,10 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     saving: RwLock::new(()),
                 });
             }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            Err(e) => {
+                rejected = true;
+                tracing::warn!(error = %e, "host pipeline library rejected; starting an empty one (the rejected file is kept as {REJECTED_FILE})");
+            }
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
@@ -487,6 +525,16 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
+    // And the file is kept under another name, not written over by this
+    // run's first save: a refusal may be this device's alone (run 263:
+    // RenderDoc's device refused the card's library, an empty one was
+    // saved over 366 MB of built pipelines, and the next run drew black
+    // until they were built again).
+    if rejected && let Some(dir) = DIR.get() {
+        if let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE)) {
+            tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
+        }
+    }
     let library = make(&[]).ok()?;
     Some(Library {
         library,
@@ -610,7 +658,10 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    // Through `used()`, which reads the list from disk first if this process
+    // has not: a process that made pipelines without the title (the offline
+    // prebuild) wrote an empty list over the runs' one.
+    let used: Vec<String> = used().iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.

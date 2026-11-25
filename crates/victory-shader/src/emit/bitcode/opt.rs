@@ -33,8 +33,8 @@
 use std::collections::HashMap;
 
 use super::{
-    Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
-    successors,
+    Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Tag, Term, Ty, TypeDef, V, for_each_operand,
+    pred, successors,
 };
 
 /// Dead-code elimination.
@@ -52,10 +52,19 @@ pub const LOADS: u32 = 16;
 /// half has a lane where every lane is in EXEC (`lower.rs`,
 /// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
+/// Not a pass over the module either: the lowering reads the dwords of one
+/// console load (`s_buffer_load_dwordx2` to `x16` from an SRV, a
+/// `global_load_dwordx2` to `x4`) by one call for every four of them, not
+/// by a call each (`lower.rs`, `raw_dwords`). The same bytes are read.
+pub const WIDE: u32 = 64;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
-pub const ALL: u32 = MODULE | FIRST;
+pub const ALL: u32 = MODULE | FIRST | WIDE;
+/// The passes that run when nothing says which: every one but [`WIDE`],
+/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
+/// for it).
+pub const DEFAULT: u32 = ALL & !WIDE;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -73,6 +82,8 @@ pub(crate) struct Usage {
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+    /// A rasterizer-ordered UAV handle.
+    pub rov: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -805,8 +816,18 @@ impl Module {
                     continue;
                 }
                 let class = self.class(&effects, i);
+                // The translation's own index clamps stay one per handle:
+                // two heap handles of different kinds (a byte-address and a
+                // structured view of one buffer) made from one clamped index
+                // make AMD's compiler (`amdxc64.dll`, drivers 26.10.1 and
+                // 26.11.2) read a null pointer and end the process; with a
+                // clamp each, it compiles them. 68 of the title's compute
+                // programs had such a pair after this pass (ped materials'
+                // `CS_RaytracingResolve`, tree skinning). The compiler joins
+                // the clamps itself afterwards.
                 if passes & REUSE != 0
                     && class == Effect::Pure
+                    && self.tags.get(&i) != Some(&Tag::Clamp)
                     && let Some(key) = self.key(i)
                 {
                     if let Some(&first) = known.get(&key) {
@@ -1004,6 +1025,8 @@ impl Module {
                 let name = name.strip_prefix("dx.op.").unwrap_or(name);
                 if name.starts_with("wave") || name.starts_with("quad") {
                     u.wave_ops = true;
+                } else if name == "annotateHandle" {
+                    u.rov |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
                 } else if name == "createHandleFromHeap" {
                     match args.get(2).and_then(|&s| self.int_k(s)) {
                         Some((_, 0)) => u.heap_views = true,

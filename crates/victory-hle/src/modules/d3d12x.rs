@@ -21,6 +21,7 @@ extern "system" fn create_device(
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
+    note_pipeline_crashes();
     device::create(adapter, parameters, iid, out)
 }
 
@@ -47,6 +48,52 @@ pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
         let _ = container;
         Err("no shader cache on this host".into())
     }
+}
+
+/// A crash in the driver's shader compiler names the pipeline it was given
+/// (`victory_gpu::pipeline::crash_note` in every crash report); once.
+pub fn note_pipeline_crashes() {
+    #[cfg(windows)]
+    {
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| victory_loader::note_on_crash(victory_gpu::pipeline::crash_note));
+    }
+}
+
+/// Before an offline prebuild translates anything: see
+/// `victory_gpu::pipeline::begin_prebuild`.
+pub fn begin_prebuild() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::begin_prebuild()
+    }
+    #[cfg(not(windows))]
+    Err("no host pipelines on this host".into())
+}
+
+/// The offline prebuild: see `victory_gpu::pipeline::prebuild_compute`.
+pub fn prebuild_compute(container: &[u8]) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::prebuild_compute(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no host pipelines on this host".into())
+    }
+}
+
+/// After a prebuild: host pipelines (compiled now, loaded from the library),
+/// and the library saved.
+pub fn finish_prebuild() -> (u64, u64) {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::save_pipeline_cache();
+        victory_gpu::pipeline::library_counts()
+    }
+    #[cfg(not(windows))]
+    (0, 0)
 }
 
 /// Keeps the host's translations of the title's shaders in `dir` (a

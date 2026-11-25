@@ -91,6 +91,13 @@ enum Command {
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
+        /// With --warm: also make each compute shader's host pipeline on
+        /// the GPU, into the run's pipeline library (a compute pipeline is
+        /// its shader alone; graphics ones need the title's state). The
+        /// device sets the host facts. Not while a run of the title is open:
+        /// it maps the library.
+        #[arg(long, requires = "warm")]
+        prebuild: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -160,6 +167,7 @@ fn main() -> Result<()> {
             list,
             jobs,
             warm,
+            prebuild,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
@@ -170,7 +178,7 @@ fn main() -> Result<()> {
                 victory_shader::emit::set_host_max_wave(n);
             }
             if let Some(file) = warm {
-                return translate::warm(paths, &file, jobs);
+                return translate::warm(paths, &file, jobs, prebuild);
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }

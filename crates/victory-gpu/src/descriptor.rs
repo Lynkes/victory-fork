@@ -188,7 +188,10 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
-    let mut page_bytes: Vec<u8> = Vec::new();
+    // One page of bytes for every page looked at, and one list of the
+    // slots to mirror for every page: neither is allocated per page.
+    let mut page_bytes = vec![0u8; crate::watch::PAGE];
+    let mut due: Vec<(u32, u64)> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
@@ -211,15 +214,15 @@ pub(crate) fn sync_heaps() {
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
-                page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
+                let slice = &mut page_bytes[..to - from];
+                if crate::host::read_into(from as *const u8, slice) {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     // The page's records in one go, under one lock
                     // (`HostHeap::mirror_copied_page`); one by one below
                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
                     let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
+                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, slice, &mut due);
                         looked += seen;
                         mirrored += made;
                         0..0
@@ -233,7 +236,7 @@ pub(crate) fn sync_heaps() {
                         let Some(at) = (handle as usize).checked_sub(from) else {
                             continue;
                         };
-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
+                        let Some(record) = slice.get(at..at + step as usize) else {
                             continue;
                         };
                         looked += 1;
@@ -918,6 +921,21 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     view_at(i, generation)
+}
+
+/// The view recorded at `handle`, and what says which record that is
+/// (`host::HostHeap::publish`).
+#[cfg(windows)]
+pub(crate) fn view_and_key(handle: u64) -> Option<(View, u64)> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: as in `view`.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != VIEW_TAG {
+        return None;
+    }
+    Some((view_at(i, generation)?, u64::from(generation) << 32 | u64::from(i)))
 }
 
 /// A description of `N` words, if the title passes one.

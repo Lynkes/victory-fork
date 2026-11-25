@@ -152,11 +152,74 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+/// `VICTORY_TRANSLATE_SKIP_FILE=<file>[;<file>...]`: container hashes, one
+/// per line, left out as with `VICTORY_TRANSLATE_SKIP` (with
+/// `VICTORY_TRANSLATE_DONE_FILE`, a `--pipelines` run a driver's compiler
+/// ended goes on where it stopped).
+fn skipped_by_file(hash: &str) -> bool {
+    static SET: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        std::env::var("VICTORY_TRANSLATE_SKIP_FILE")
+            .unwrap_or_default()
+            .split(';')
+            .filter(|f| !f.is_empty())
+            .filter_map(|f| std::fs::read_to_string(f).ok())
+            .flat_map(|text| {
+                text.lines()
+                    .map(|l| l.trim().to_lowercase())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|h| !h.is_empty())
+            .collect()
+    })
+    .contains(hash)
+}
+
+/// `VICTORY_TRANSLATE_DONE_FILE=<file>`: a container's hash is appended
+/// when everything is done with it (dropped at any return; not when the
+/// process ends inside it).
+struct DoneMark<'a>(&'a str);
+
+impl Drop for DoneMark<'_> {
+    fn drop(&mut self) {
+        use std::io::Write;
+        static FILE: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+        let file = FILE.get_or_init(|| {
+            let path = std::env::var_os("VICTORY_TRANSLATE_DONE_FILE")?;
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
+            Some(Mutex::new(f))
+        });
+        if let Some(f) = file {
+            let _ = writeln!(lock(f), "{}", self.0);
+        }
+    }
+}
+
+thread_local! {
+    /// The program whose host pipeline this thread is making (`--pipelines`).
+    static MAKING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// For crash reports, on the faulting thread: the program whose pipeline
+/// the driver was compiling.
+fn making_note() -> String {
+    MAKING
+        .try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default())
+        .ok()
+        .filter(|m| !m.is_empty())
+        .map(|m| format!("making the host pipeline of {m}"))
+        .unwrap_or_default()
+}
+
 /// `translate --warm <file>`: the containers whose hash the file names are
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
 /// translating each at its first use.
-pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()> {
+pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, prebuild: bool) -> Result<()> {
     // `--warm all`: every container found, whatever its hash.
     let all = file.as_os_str() == "all";
     let mut wanted: HashSet<String> = HashSet::new();
@@ -178,9 +241,18 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
     let threads = jobs.unwrap_or(4).max(1);
+    if prebuild {
+        // The device first: its facts are part of every translation below.
+        victory_hle::modules::d3d12x::begin_prebuild().map_err(anyhow::Error::msg)?;
+        // A fault in the driver's compiler names the pipeline it was given.
+        victory_loader::report_crashes();
+        victory_hle::modules::d3d12x::note_pipeline_crashes();
+    }
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
+    // compute shaders whose host pipeline was made / that got none
+    let built = [const { AtomicUsize::new(0) }; 2];
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
@@ -216,6 +288,10 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                                 Err(_) => 2,
                             };
                             counts[which].fetch_add(1, Ordering::Relaxed);
+                            if prebuild && which < 2 && is_compute(&bytes) {
+                                let ok = victory_hle::modules::d3d12x::prebuild_compute(&bytes).is_ok();
+                                built[usize::from(!ok)].fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     });
                 }
@@ -230,7 +306,26 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
         translated + there + failed,
         began.elapsed().as_secs_f64()
     );
+    if prebuild {
+        let (made, loaded) = victory_hle::modules::d3d12x::finish_prebuild();
+        println!(
+            "prebuild     {} compute pipelines in the library ({made} compiled now, {loaded} there already), {} got none",
+            built[0].load(Ordering::Relaxed),
+            built[1].load(Ordering::Relaxed),
+        );
+    }
     Ok(())
+}
+
+/// Whether a console container holds a compute program (its host pipeline
+/// is its shader alone, so it can be made ahead of a run).
+fn is_compute(container: &[u8]) -> bool {
+    let Ok(c) = Container::parse(container) else {
+        return false;
+    };
+    c.part(victory_shader::FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(|p| p.stage == HwStage::Cs))
 }
 
 pub fn run(
@@ -257,6 +352,9 @@ pub fn run(
     }
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
+        // A fault in the driver's compiler names the program it was given.
+        victory_loader::report_crashes();
+        victory_loader::note_on_crash(making_note);
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -415,6 +513,22 @@ fn translate(
     if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
         return;
     }
+    // `VICTORY_TRANSLATE_SKIP=<hash prefix>,...`: those containers left out
+    // (e.g. the ones a driver's compiler faults on, to check the rest with
+    // `--pipelines`).
+    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        std::env::var("VICTORY_TRANSLATE_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if skip.iter().any(|s| hash.starts_with(s.as_str())) || skipped_by_file(&hash) {
+        return;
+    }
+    let _done = DoneMark(&hash);
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
@@ -632,12 +746,14 @@ fn check(
         );
     }
     if let Some((h, stub_ps)) = &checks.host {
+        MAKING.with(|m| *m.borrow_mut() = label());
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
+        MAKING.with(|m| m.borrow_mut().clear());
         match made {
             Ok(()) => {
                 *counter(t, shader.stage, 3) += 1;
