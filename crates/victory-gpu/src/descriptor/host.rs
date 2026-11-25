@@ -133,6 +133,19 @@ pub(crate) fn next_start(start: u64, end: u64) -> Option<u64> {
         .min()
 }
 
+/// The bytes of the placed texture at `start` (`len` at full size) that are
+/// its own: up to where the next texture placed inside it starts
+/// ([`next_start`]), all of them if none does. (Port of the texture
+/// re-check fix in fxceless/victory-fork#995, by tunczzz.)
+pub(crate) fn texture_own_bytes(start: u64, len: u64) -> u64 {
+    texture_own_len(next_start(start, start.saturating_add(len)), start, len)
+}
+
+/// [`texture_own_bytes`] given where the next texture starts.
+fn texture_own_len(next: Option<u64>, start: u64, len: u64) -> u64 {
+    next.map_or(len, |at| at.saturating_sub(start).clamp(1, len))
+}
+
 /// The lowest level that a view of the placed texture at `start` shows,
 /// over the slots shaders pick by index that hold one now. The title
 /// views a texture from the first level it holds. `None`: no such slot.
@@ -328,7 +341,13 @@ impl Spans {
     /// The first span that starts inside `[start, end)` past the first
     /// [`HEAD`] bytes of it.
     fn next_start(&self, start: u64, end: u64) -> Option<u64> {
-        self.by_start.range(start.saturating_add(HEAD)..end).next().map(|(at, _)| *at)
+        // A texture smaller than HEAD has nothing past its head to look in
+        // (BTreeMap::range panics when the start is past the end).
+        let from = start.saturating_add(HEAD);
+        if from >= end {
+            return None;
+        }
+        self.by_start.range(from..end).next().map(|(at, _)| *at)
     }
 
     /// The slots that hold a view of the texture at `start`.
@@ -3461,6 +3480,25 @@ mod tests {
         // The view from level 1 goes: the texture is viewed from level 3.
         spans.forget(2);
         assert_eq!(spans.first_viewed(0x1_0000), Some(3));
+    }
+
+    /// A texture's own bytes for the re-check after its upload end where a
+    /// texture placed in its large levels starts (packed textures: 16 KiB
+    /// apart, 684 KiB each at full size). From #995, with a texture smaller
+    /// than the head, which made `BTreeMap::range` panic.
+    #[test]
+    fn own_bytes_end_at_the_next_texture_placed_inside() {
+        let mut spans = Spans::default();
+        spans.note(1, 0xb5bc3_0000, 0xb5bc3_0000 + 700_416, true);
+        let len = 700_416;
+        assert_eq!(texture_own_len(spans.next_start(0xb5bc3_0000, 0xb5bc3_0000 + len), 0xb5bc3_0000, len), len);
+        spans.note(2, 0xb5bc3_4000, 0xb5bc3_4000 + 700_416, true);
+        // Both kept (the neighbour starts past the first 4 KiB).
+        assert_eq!(spans.slots_at(0xb5bc3_0000), vec![1]);
+        assert_eq!(texture_own_len(spans.next_start(0xb5bc3_0000, 0xb5bc3_0000 + len), 0xb5bc3_0000, len), 0x4000);
+        assert_eq!(texture_own_len(spans.next_start(0xb5bc3_4000, 0xb5bc3_4000 + len), 0xb5bc3_4000, len), len);
+        // Smaller than the head: nothing past it to look in, and no panic.
+        assert_eq!(spans.next_start(0xb5bc3_0000, 0xb5bc3_0000 + 16), None);
     }
 
     /// Views of one placed texture are told from views of others by the

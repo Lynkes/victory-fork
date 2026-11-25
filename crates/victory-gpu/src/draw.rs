@@ -2049,8 +2049,15 @@ impl State {
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
+            // Of its memory, only the bytes before the next texture placed in
+            // it (`descriptor::host::texture_own_bytes`, from #995): the title
+            // keeps only a texture's small levels and places the next textures
+            // where its large ones would be, so the fingerprint saw the
+            // neighbours stream in and the texture was uploaded again with
+            // their bytes as its own large levels (the blocks on the near
+            // surfaces at the bottom of the picture).
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                if crate::texture::fingerprint(at, crate::descriptor::host::texture_own_bytes(at, len)) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -2243,6 +2250,7 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
+                    let len = crate::descriptor::host::texture_own_bytes(at, len);
                     let print = crate::texture::fingerprint(at, len);
                     host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
                 }
