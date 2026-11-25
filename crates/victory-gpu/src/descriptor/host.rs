@@ -26,6 +26,7 @@ const SLOT_IN_BUFFERS: u8 = 1 << 2;
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
@@ -36,6 +37,9 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Lock-free atomic mirror of `made` for the ~98% cache-hit path in
+    /// `HostHeap::mirror` (written under `made`'s lock with Release ordering).
+    made_fast: Vec<std::sync::atomic::AtomicU64>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -970,11 +974,13 @@ impl HostHeap {
         let h = HostHeap {
             heap,
             cpu,
+            gpu,
             step,
             count,
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            made_fast: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -1458,6 +1464,7 @@ impl HostHeap {
         if key == 0 {
             return;
         }
+        self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
         match view_at(key as u32, (key >> 32) as u32) {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
@@ -1875,10 +1882,8 @@ impl HostHeap {
 
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 
@@ -2095,6 +2100,22 @@ impl HostHeap {
         for_draw: bool,
         record_change: bool,
     ) -> Option<(View, Option<BufferCopy>)> {
+        // Lock-free fast path (#1117; most draw and pass lookups): the host
+        // slot already holds the view the title's record names, so `made`'s
+        // lock is not taken. Same answer as `mirror_with_made` gives for a
+        // slot made from this key (no copy resolved: the caller looks it up).
+        if index < self.count {
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let key = u64::from(generation) << 32 | u64::from(i);
+            if tag == VIEW_TAG
+                && key != 0
+                && self.made_fast[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
+                && let Some(view) = view_at(i, generation)
+            {
+                return Some((view, None));
+            }
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         self.mirror_with_made(&mut made, index, handle, for_draw, record_change, None)
     }
@@ -2136,6 +2157,7 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.make_null(index);
                 let _ = self.note_buffer_into(index, None, false, record_change, batch);
             } else if for_draw {
@@ -2217,6 +2239,10 @@ impl HostHeap {
                     }
                 }
             }
+            // Published for `mirror_inner`'s lock-free path (#1117) AFTER the
+            // descriptor and the kept resource are in place: 0 for a slot
+            // left for later, the key for one made.
+            self.made_fast[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
         }
         Some((view, resolved))
     }
