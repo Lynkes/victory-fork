@@ -3489,16 +3489,16 @@ mod tests {
     #[test]
     fn own_bytes_end_at_the_next_texture_placed_inside() {
         let mut spans = Spans::default();
-        spans.note(1, 0xb5bc3_0000, 0xb5bc3_0000 + 700_416, true);
+        spans.note(1, 0xb_5bc3_0000, 0xb_5bc3_0000 + 700_416, true);
         let len = 700_416;
-        assert_eq!(texture_own_len(spans.next_start(0xb5bc3_0000, 0xb5bc3_0000 + len), 0xb5bc3_0000, len), len);
-        spans.note(2, 0xb5bc3_4000, 0xb5bc3_4000 + 700_416, true);
+        assert_eq!(texture_own_len(spans.next_start(0xb_5bc3_0000, 0xb_5bc3_0000 + len), 0xb_5bc3_0000, len), len);
+        spans.note(2, 0xb_5bc3_4000, 0xb_5bc3_4000 + 700_416, true);
         // Both kept (the neighbour starts past the first 4 KiB).
-        assert_eq!(spans.slots_at(0xb5bc3_0000), vec![1]);
-        assert_eq!(texture_own_len(spans.next_start(0xb5bc3_0000, 0xb5bc3_0000 + len), 0xb5bc3_0000, len), 0x4000);
-        assert_eq!(texture_own_len(spans.next_start(0xb5bc3_4000, 0xb5bc3_4000 + len), 0xb5bc3_4000, len), len);
+        assert_eq!(spans.slots_at(0xb_5bc3_0000), vec![1]);
+        assert_eq!(texture_own_len(spans.next_start(0xb_5bc3_0000, 0xb_5bc3_0000 + len), 0xb_5bc3_0000, len), 0x4000);
+        assert_eq!(texture_own_len(spans.next_start(0xb_5bc3_4000, 0xb_5bc3_4000 + len), 0xb_5bc3_4000, len), len);
         // Smaller than the head: nothing past it to look in, and no panic.
-        assert_eq!(spans.next_start(0xb5bc3_0000, 0xb5bc3_0000 + 16), None);
+        assert_eq!(spans.next_start(0xb_5bc3_0000, 0xb_5bc3_0000 + 16), None);
     }
 
     /// Views of one placed texture are told from views of others by the
