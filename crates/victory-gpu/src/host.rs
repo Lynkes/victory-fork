@@ -2155,13 +2155,23 @@ impl Deferred {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
         self.copies.clear();
-        self.uploads.clear();
+        // The host objects the list held: their release is a kernel call
+        // each (`DestroyAllocation`), 14.5 ms a frame of the thread that
+        // recycles landed lists while the title streams (profile 25/11). A
+        // reset comes after the list's last submission finished, so they go
+        // to the release thread ([`Elsewhere`]); the vectors keep their room.
+        if !self.uploads.is_empty() || !self.kept.is_empty() || !self.backs.is_empty() {
+            fn swap_out<T>(v: &mut Vec<T>) -> Vec<T> {
+                let room = v.capacity();
+                std::mem::replace(v, Vec::with_capacity(room))
+            }
+            let held = (swap_out(&mut self.uploads), swap_out(&mut self.kept), swap_out(&mut self.backs));
+            drop(Elsewhere::new(held));
+        }
         self.upload_bytes = 0;
-        self.kept.clear();
         self.refreshed.clear();
         self.textures.clear();
         self.writes.clear();
-        self.backs.clear();
         self.budget_zeroed = false;
         self.indirect_readable = 0;
     }
