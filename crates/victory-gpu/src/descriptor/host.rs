@@ -2681,7 +2681,7 @@ impl HostHeap {
                 Some(&view),
                 for_draw,
                 record_change,
-                batch.as_mut().map(|b| &mut **b),
+                batch.as_deref_mut(),
             );
             for stale in stale {
                 if stale != index {
