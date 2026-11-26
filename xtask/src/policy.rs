@@ -11,6 +11,11 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 const MAX_FILE_SIZE: usize = 512 * 1024;
+/// Source files allowed past [`MAX_FILE_SIZE`], each with a limit of its own:
+/// the shader translator's one file outgrew it with the shader fixes taken in
+/// (local; the RX 7900 XTX fork allows it 640 KiB too). Every other file keeps
+/// the common limit.
+const LARGE_FILES: &[(&str, usize)] = &[("crates/victory-shader/src/emit/lower.rs", 640 * 1024)];
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
@@ -154,11 +159,12 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
-    if content.len() > MAX_FILE_SIZE {
-        problems.push(format!(
-            "{} bytes exceeds the {MAX_FILE_SIZE}-byte limit",
-            content.len()
-        ));
+    let limit = LARGE_FILES
+        .iter()
+        .find(|&&(large, _)| large == path)
+        .map_or(MAX_FILE_SIZE, |&(_, limit)| limit);
+    if content.len() > limit {
+        problems.push(format!("{} bytes exceeds the {limit}-byte limit", content.len()));
     }
     for (magic, what) in FORBIDDEN_MAGIC {
         if content.starts_with(magic) {
@@ -196,6 +202,17 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+    }
+
+    /// The translator's file has a larger limit of its own; any other source
+    /// file of that size is still refused.
+    #[test]
+    fn only_the_listed_large_file_passes_the_common_limit() {
+        let source = vec![b'x'; 600 * 1024];
+        assert!(check("crates/victory-shader/src/emit/lower.rs", &source).is_empty());
+        assert!(!check("crates/victory-shader/src/emit/mod.rs", &source).is_empty());
+        let past = vec![b'x'; 640 * 1024 + 1];
+        assert!(!check("crates/victory-shader/src/emit/lower.rs", &past).is_empty());
     }
 
     #[test]
