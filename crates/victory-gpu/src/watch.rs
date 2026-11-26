@@ -807,8 +807,15 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 
 /// Whether a block found uncommitted inside a placeholder is "parked": not
 /// asked about again (`VirtualQuery`, [`uncommitted_end`]) at every walk
-/// over a range that covers it (`VICTORY_VIEW_PARK=0`: asked every time, as
-/// before). After pull request #812 (Peppacodes), its parked blocks alone.
+/// over a range that covers it (`VICTORY_VIEW_PARK=1`; off by default:
+/// asked every time, as before). After pull request #812 (Peppacodes), its
+/// parked blocks alone.
+///
+/// Measured (Series S, 26 November): the write-watch askings 20 -> 11 ms a
+/// frame and the submitting thread 81 -> 74 ms, but no frame gain: the
+/// frame is then set by the title's recording threads. Off until that
+/// changes; one of its two runs lost the card (as about one run in five
+/// does without it), which says nothing either way yet.
 ///
 /// The walk asked Windows about each block it had noted absent at every
 /// asking: 10 ms a frame of the submitting thread here (Series S profile,
@@ -822,7 +829,7 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// frames all the same, and an ordinary reservation is never parked.
 fn view_park() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_PARK").is_none_or(|v| v != "0") && placeholders_told())
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_PARK").is_some_and(|v| v == "1") && placeholders_told())
 }
 
 /// Frames a parked block goes unasked at least (`VICTORY_VIEW_PARK_FRAMES`,
