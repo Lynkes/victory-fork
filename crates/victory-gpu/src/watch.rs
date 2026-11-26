@@ -818,14 +818,15 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// the runtime's mapping, which tells of itself ([`title_memory_remapped`]).
 /// The title calls Windows' own `VirtualFree` and `VirtualAlloc`, though, so
 /// a placeholder can be released and its addresses reserved again with no
-/// word to us: a parked block is looked at again after [`park_frames`]
+/// word to us: a parked block is looked at again after [`park_life`]
 /// frames all the same, and an ordinary reservation is never parked.
 fn view_park() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_PARK").is_none_or(|v| v != "0") && placeholders_told())
 }
 
-/// Frames a parked block goes unasked (`VICTORY_VIEW_PARK_FRAMES`, 30).
+/// Frames a parked block goes unasked at least (`VICTORY_VIEW_PARK_FRAMES`,
+/// 30; [`park_life`]).
 fn park_frames() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -849,12 +850,23 @@ pub(crate) fn park_stats() -> ([u64; 3], usize) {
     (taken, g.parked.values().filter(|p| p.1).count())
 }
 
+/// How many frames a look at `block` stands for: [`park_frames`], and as
+/// many again at most, by the block's number. Blocks parked in the same
+/// frame (some 95,000 as the world loads) are then looked at again spread
+/// over that many frames, not all in one: in one they were tens of
+/// thousands of questions in a single frame, every [`park_frames`] frames
+/// (the long frames "preparing" leads went from 72 to 111 in a run).
+fn park_life(block: usize) -> u64 {
+    let frames = park_frames();
+    frames + block as u64 % frames
+}
+
 /// Whether `block`, absent, was parked lately ([`view_park`]).
 fn parked_still(g: &Guards, block: usize) -> bool {
     view_park()
         && g.parked
             .get(&block)
-            .is_some_and(|&(at, placeholder)| placeholder && crate::frame::current().saturating_sub(at) < park_frames())
+            .is_some_and(|&(at, placeholder)| placeholder && crate::frame::current().saturating_sub(at) < park_life(block))
 }
 
 /// `block` was just found uncommitted: noted with the frame and whether it
@@ -864,7 +876,7 @@ fn park(g: &mut Guards, block: usize) {
         return;
     }
     let now = crate::frame::current();
-    if g.parked.get(&block).is_some_and(|&(at, _)| now.saturating_sub(at) < park_frames()) {
+    if g.parked.get(&block).is_some_and(|&(at, _)| now.saturating_sub(at) < park_life(block)) {
         return;
     }
     PARK_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
