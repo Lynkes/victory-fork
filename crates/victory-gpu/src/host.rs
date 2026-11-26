@@ -8792,6 +8792,15 @@ impl Meter {
                 slow[1] as f64 / 1e3 / frames,
                 slow[2] as f64 / 1e3
             );
+            {
+                let ([answered, asked, looked], parked) = crate::watch::park_stats();
+                tracing::info!(
+                    "blocks of view memory found uncommitted, per frame (VICTORY_VIEW_PARK): {:.0} answered as parked, {:.0} questions                      to Windows whether they still are, {:.1} looked at for parking; {parked} parked in placeholders now",
+                    answered as f64 / frames,
+                    asked as f64 / frames,
+                    looked as f64 / frames
+                );
+            }
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(
