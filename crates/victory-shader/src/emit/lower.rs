@@ -2383,8 +2383,14 @@ impl<'a> Lower<'a> {
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
                     // The primitive-ordered section's entry word (`enters_pops`):
-                    // zero is "no earlier wave to wait for".
-                    None if n == POPS_WAVE_SGPR && self.pops => Val::I32(self.s.m.i32(0)),
+                    // overlap bit 31 clear ("no earlier wave to wait for"),
+                    // wave id 1 in bits 16..25 and collision id 0 in bits 0..9.
+                    // The two ids differ, as the hardware's always do, so the
+                    // wait test (`wave_id + !collision_id` against the exiting
+                    // wave id, 0) passes at once even for a lane that falls
+                    // into the wait loop with EXEC clear; with both 0 such a
+                    // lane spun to the loop limit (upstream VIctory #2395).
+                    None if n == POPS_WAVE_SGPR && self.pops => Val::I32(self.s.m.i32(1 << 16)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
