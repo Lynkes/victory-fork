@@ -61,8 +61,14 @@ enum Held {
     /// With [`present_behind`] or [`present_queued`]: the title's present
     /// of a frame, due after what the queue holds before it: the host
     /// texture shown (none in the tests), the state the title's lists
-    /// leave it in, and the frame's number.
-    Present(Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>, u32, u64),
+    /// leave it in, the frame's number, and the second plane (the Series S
+    /// interface, blended over the first: `crate::compose`) with its state.
+    Present(
+        Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+        u32,
+        u64,
+        Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+    ),
     /// With [`present_queued`]: where another queue's line stood when the
     /// title presented frame `.0`. What is ahead of it ran before that
     /// present when the present ran the lines itself, and still does: the
@@ -176,7 +182,7 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     let texture = texture.clone();
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(Some(texture), state, frame)
+        Held::Present(Some(texture), state, frame, None)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -304,8 +310,26 @@ fn queue_present(this: This, planes: u32, plane_parameters: *const Plane) -> boo
     const COPY_SOURCE: u32 = 0x800;
     let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
     crate::resource::host_transition(resource, state);
+    // The second plane (the interface, with the Series S profile), blended
+    // over the first when the frame is shown (`crate::compose`), as
+    // `present_now` does when it shows the frame itself.
+    let interface = (planes > 1 && crate::compose::on())
+        // SAFETY: the title passes `planes` descriptions of PLANE_STRIDE bytes.
+        .then(|| unsafe { plane_parameters.cast::<u8>().add(PLANE_STRIDE).cast::<Plane>().as_ref() })
+        .flatten()
+        .filter(|p| p.count > 0 && !p.resources.is_null())
+        // SAFETY: the plane lists `count` resources.
+        .map(|p| unsafe { *p.resources })
+        .filter(|&r| r != resource)
+        .and_then(|r| {
+            let texture = crate::resource::host_resource(r)?.clone();
+            const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+            let state = crate::resource::host_transition(r, PIXEL_SHADER_RESOURCE).map_or(PIXEL_SHADER_RESOURCE, |(_, before)| before);
+            crate::resource::host_transition(r, state);
+            Some((texture, state))
+        });
     let in_lines = PRESENTS_HELD.fetch_add(1, Ordering::AcqRel) + 1;
-    queue_present_into(&Queues, this as usize, Some(texture), state, frame);
+    queue_present_into(&Queues, this as usize, Some(texture), state, frame, interface);
     QUEUED_STATS[0].fetch_add(1, Ordering::Relaxed);
     QUEUED_STATS[3].fetch_add(in_lines, Ordering::Relaxed);
     QUEUED_STATS[4].fetch_max(in_lines, Ordering::Relaxed);
@@ -322,6 +346,7 @@ fn queue_present_into<L: Lines>(
     texture: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
     state: u32,
     frame: u64,
+    interface: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
 ) {
     for other in lines.all_lines() {
         if other == q {
@@ -332,7 +357,7 @@ fn queue_present_into<L: Lines>(
             held.push(Held::Mark(frame));
         }
     }
-    lock(lines.line(q)).push(Held::Present(texture, state, frame));
+    lock(lines.line(q)).push(Held::Present(texture, state, frame, interface));
     lines.join_waiting(q);
 }
 
@@ -973,6 +998,7 @@ trait Lines {
         held: std::sync::MutexGuard<'a, Vec<Held>>,
         texture: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
         state: u32,
+        interface: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
         frame: u64,
         all: bool,
     ) -> std::sync::MutexGuard<'a, Vec<Held>>;
@@ -1105,6 +1131,7 @@ impl Lines for Queues {
         mut held: std::sync::MutexGuard<'a, Vec<Held>>,
         texture: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
         state: u32,
+        interface: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
         frame: u64,
         all: bool,
     ) -> std::sync::MutexGuard<'a, Vec<Held>> {
@@ -1112,7 +1139,7 @@ impl Lines for Queues {
             if let Some(host) = crate::host::host()
                 && let Some(texture) = &texture
             {
-                let _ = host.present(texture, state, None, frame);
+                let _ = host.present(texture, state, interface.as_ref().map(|(t, s)| (t, *s)), frame);
             }
         };
         if all {
@@ -1192,7 +1219,7 @@ fn walk<L: Lines>(lines: &L, all: bool, joining: bool, marks: bool) {
                     Some(Held::Present(..)) if !joined.is_empty() => break,
                     // A queued present: once every other line has reached
                     // its mark of the frame.
-                    Some(&Held::Present(_, _, frame)) if marks && !all && ahead_of_mark(lines, q, frame) => break,
+                    Some(&Held::Present(_, _, frame, _)) if marks && !all && ahead_of_mark(lines, q, frame) => break,
                     // Behind a mark: once the frame has been shown.
                     Some(&Held::Mark(frame)) if !all && lines.shown() < frame => break,
                     Some(_) => {}
@@ -1253,8 +1280,8 @@ fn walk<L: Lines>(lines: &L, all: bool, joining: bool, marks: bool) {
                         }
                         held = lines.run(line, held, lists, order, all);
                     }
-                    Held::Present(texture, state, frame) => {
-                        held = lines.present(line, held, texture, state, frame, all);
+                    Held::Present(texture, state, frame, interface) => {
+                        held = lines.present(line, held, texture, state, interface, frame, all);
                     }
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
@@ -2204,6 +2231,7 @@ mod join_tests {
             held: std::sync::MutexGuard<'a, Vec<Held>>,
             _: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
             _: u32,
+            _: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
             frame: u64,
             _: bool,
         ) -> std::sync::MutexGuard<'a, Vec<Held>> {
@@ -2407,7 +2435,7 @@ mod join_tests {
             for &g in &given {
                 if let Given::Present = g {
                     frame += 1;
-                    queue_present_into(&new, 0, None, 0, frame);
+                    queue_present_into(&new, 0, None, 0, frame, None);
                 } else {
                     give(&new, g);
                 }
@@ -2458,7 +2486,7 @@ mod join_tests {
                         assert!(looks < 64, "round {round}: the title stood at the bound for good: {:?}", fake.done());
                     }
                     frame += 1;
-                    queue_present_into(&fake, 0, None, 0, frame);
+                    queue_present_into(&fake, 0, None, 0, frame, None);
                 } else {
                     if let Given::Part(q, p) = g {
                         epoch.insert(p, (q, frame));
