@@ -353,7 +353,10 @@ pub(crate) fn line(frames: f64) {
     let [copies, bytes, gone, lately, small, fills] = [0, 1, 2, 3, 4, 5].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
     let [writes, wbytes, wgone] = [0, 1, 2].map(|i| WRITE_COUNT[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
-        "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source          faulted in the last two seconds, {small:.0} of under {LEAST} bytes; fills of under {LEAST} bytes made in place          (VICTORY_FILLS_PLAIN): {fills:.0}; writes back in place: {writes:.0}, {:.1} MB, {wgone:.1} fell back",
+        "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
+         that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
+         faulted in the last two seconds, {small:.0} of under {LEAST} bytes; fills of under {LEAST} bytes made in place \
+         (VICTORY_FILLS_PLAIN): {fills:.0}; writes back in place: {writes:.0}, {:.1} MB, {wgone:.1} fell back",
         bytes / 1e6,
         wbytes / 1e6
     );

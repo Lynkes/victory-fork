@@ -1166,7 +1166,20 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
-            if focused() {
+            // Diagnostics builds: `VICTORY_HOST_KEYS=0` leaves the PC's own
+            // keyboard out, so a scripted run is not changed by whoever uses
+            // the PC meanwhile (with the session unlocked the title's window
+            // has the focus, and keys held on the PC reached the title while
+            // it booted: the runs of 26/11 ended in the title's own assert
+            // at frame 82).
+            #[cfg(feature = "diagnostics")]
+            let host_keys = {
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *ON.get_or_init(|| std::env::var_os("VICTORY_HOST_KEYS").is_none_or(|v| v != "0"))
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let host_keys = true;
+            if host_keys && focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
