@@ -208,11 +208,14 @@ mod tests {
     /// file of that size is still refused.
     #[test]
     fn only_the_listed_large_file_passes_the_common_limit() {
-        let source = vec![b'x'; 600 * 1024];
+        // Lines that read as source (a long run of one letter is refused as
+        // encoded data, whatever its size).
+        let line = b"fn x() {}\n";
+        let of = |bytes: usize| line.iter().copied().cycle().take(bytes).collect::<Vec<u8>>();
+        let source = of(600 * 1024);
         assert!(check("crates/victory-shader/src/emit/lower.rs", &source).is_empty());
         assert!(!check("crates/victory-shader/src/emit/mod.rs", &source).is_empty());
-        let past = vec![b'x'; 640 * 1024 + 1];
-        assert!(!check("crates/victory-shader/src/emit/lower.rs", &past).is_empty());
+        assert!(!check("crates/victory-shader/src/emit/lower.rs", &of(640 * 1024 + 1)).is_empty());
     }
 
     #[test]
