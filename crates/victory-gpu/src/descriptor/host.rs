@@ -784,6 +784,32 @@ pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
 fn view_stride(view: &View) -> Option<u32> {
+    let (stride, raw, format) = view_elements(view)?;
+    Some(if stride > 0 {
+        stride
+    } else if raw {
+        1
+    } else {
+        crate::resource::element(format).map_or(0, |(bytes, _)| bytes as u32)
+    })
+}
+
+/// What else the table of strides says of a typed buffer view of an integer
+/// format (`victory_shader::emit::VIEW_INTEGER`): its 16-bit typed accesses
+/// pass bits. 0 for any other view. (After VIctory 4243a96a, by way of the
+/// RX 7900 XTX fork's 9a6c829.)
+fn view_kind(view: &View) -> u32 {
+    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    match view_elements(view) {
+        Some((0, false, 3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62)) => VIEW_INTEGER,
+        Some((0, false, 4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64)) => VIEW_INTEGER | VIEW_SIGNED,
+        _ => 0,
+    }
+}
+
+/// A buffer view's structure stride, whether it is raw, and its format;
+/// `None` if `view` is not a buffer view.
+fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
@@ -794,23 +820,16 @@ fn view_stride(view: &View) -> Option<u32> {
         _ => return None,
     };
     // SAFETY: buffer views' union members.
-    let (stride, raw, format) = unsafe {
+    Some(unsafe {
         if unordered {
             let d = uav_desc(words);
             let b = d.Anonymous.Buffer;
-            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, d.Format)
+            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, d.Format.0 as u32)
         } else {
             let d = srv_desc(words);
             let b = d.Anonymous.Buffer;
-            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, d.Format)
+            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, d.Format.0 as u32)
         }
-    };
-    Some(if stride > 0 {
-        stride
-    } else if raw {
-        1
-    } else {
-        crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes as u32)
     })
 }
 
@@ -1716,12 +1735,15 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
+        // The format kind beside the stride ([`view_kind`]): shaders mask the
+        // stride out with `VIEW_STRIDE_BITS`.
+        let kind = view.map_or(0, view_kind);
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
         }
         // The set is only written here: a slot with its flag set is in it,
         // and the lock is taken only to put one in or to take one out.
@@ -3499,6 +3521,25 @@ mod tests {
         assert_eq!(texture_own_len(spans.next_start(0xb_5bc3_4000, 0xb_5bc3_4000 + len), 0xb_5bc3_4000, len), len);
         // Smaller than the head: nothing past it to look in, and no panic.
         assert_eq!(spans.next_start(0xb_5bc3_0000, 0xb_5bc3_0000 + 16), None);
+    }
+
+    /// Typed buffer views of integer formats are marked in the table of
+    /// strides; float, normalized, raw and structured ones are not (from the
+    /// RX 7900 XTX fork's 9a6c829).
+    #[test]
+    fn integer_typed_buffer_views_are_marked_in_the_table_of_strides() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS};
+        // Format, dimension (buffer), first element, count, stride, counter, flags.
+        let uav = |format, stride, flags| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]));
+        assert_eq!(view_kind(&uav(12, 0, 0)), VIEW_INTEGER, "R16G16B16A16_UINT");
+        assert_eq!(view_kind(&uav(59, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R16_SINT");
+        assert_eq!(view_kind(&uav(10, 0, 0)), 0, "R16G16B16A16_FLOAT");
+        assert_eq!(view_kind(&uav(58, 0, 0)), 0, "R16_SNORM");
+        assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
+        assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
+        assert_eq!(view_stride(&uav(12, 0, 0)), Some(8));
+        // The kind bits never reach the stride a shader reads.
+        assert_eq!((8 | VIEW_INTEGER | VIEW_SIGNED) & VIEW_STRIDE_BITS, 8);
     }
 
     /// Views of one placed texture are told from views of others by the
