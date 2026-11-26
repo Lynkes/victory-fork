@@ -511,6 +511,7 @@ fn wake() {
 #[cfg(windows)]
 fn worker() {
     crate::framelog::keep_on_fast_cores("victory-submit");
+    crate::framelog::keep_a_core_for("victory-submit");
     loop {
         {
             let mut work = lock(&WORK.0);

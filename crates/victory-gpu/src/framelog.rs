@@ -204,6 +204,89 @@ fn cpu_sets() -> Vec<(u32, u8, u8)> {
     sets
 }
 
+/// The system's processor sets of group 0 with what tells cores apart: each
+/// one's id, its physical core and its scheduling class (the system's rank
+/// of the core, from the processor's own preferred-core table where it has
+/// one).
+fn core_sets() -> Vec<(u32, u8, u8)> {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut bytes = 0u32;
+    // SAFETY: a size query, then the call into a buffer of that size.
+    unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    // SAFETY: as above; the buffer holds `bytes` bytes, aligned for the records.
+    let ok = unsafe { GetSystemCpuSetInformation(buffer.as_mut_ptr().cast(), bytes, &mut bytes, GetCurrentProcess(), 0) };
+    let mut sets = Vec::new();
+    let mut at = 0usize;
+    while ok != 0 && at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes as usize {
+        // SAFETY: a record inside the buffer; each says its own size.
+        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_CPU_SET_INFORMATION>()) };
+        if info.Size == 0 {
+            break;
+        }
+        // SAFETY: the record's type is CpuSet (the only one there is); the
+        // scheduling class shares its bytes with a reserved word, and is
+        // what the system fills there.
+        let set = unsafe { &info.Anonymous.CpuSet };
+        if set.Group == 0 {
+            let class = unsafe { set.Anonymous2.SchedulingClass };
+            sets.push((set.Id, set.CoreIndex, class));
+        }
+        at += info.Size as usize;
+    }
+    sets
+}
+
+/// Gives the calling thread a physical core of its own
+/// (`VICTORY_SUBMIT_CORE=1`; off by default). For the layer's submit thread:
+/// the frame waits for it, and the process runs more busy threads than the
+/// processor has (the title's recording threads, pipeline, storage and
+/// copy workers), so it was put aside for others while the render thread
+/// waited on it. Every other thread of the process is asked to keep off both
+/// logical processors of the core (the process's default sets: the title's
+/// threads too), this one is asked onto one of them, and its priority is
+/// raised a step. Asked, not forced: the scheduler uses the core for others
+/// when nothing else is free. The core: the system's best by scheduling
+/// class (a preferred core, where the processor ranks them), else the last
+/// one (core 0 takes most interrupts).
+pub fn keep_a_core_for(what: &str) {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentThread, SetProcessDefaultCpuSets, SetThreadPriority,
+        SetThreadSelectedCpuSets, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+    if !std::env::var_os("VICTORY_SUBMIT_CORE").is_some_and(|v| v == "1") {
+        return;
+    }
+    let sets = core_sets();
+    let Some(&(_, core, class)) = sets.iter().max_by_key(|&&(_, core, class)| (class, core)) else {
+        return;
+    };
+    let mine: Vec<u32> = sets.iter().filter(|s| s.1 == core).map(|s| s.0).collect();
+    let others: Vec<u32> = sets.iter().filter(|s| s.1 != core).map(|s| s.0).collect();
+    if mine.is_empty() || others.is_empty() {
+        return;
+    }
+    // SAFETY: our own process and thread, and lists of the system's own set ids.
+    let (kept_off, onto, raised) = unsafe {
+        (
+            SetProcessDefaultCpuSets(GetCurrentProcess(), others.as_ptr(), others.len() as u32) != 0,
+            SetThreadSelectedCpuSets(GetCurrentThread(), mine.as_ptr(), 1) != 0,
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) != 0,
+        )
+    };
+    tracing::info!(
+        what,
+        core,
+        class,
+        logical = mine.len(),
+        kept_off,
+        onto,
+        raised,
+        "a physical core is kept for this thread, the rest of the process asked off it (VICTORY_SUBMIT_CORE=1)"
+    );
+}
+
 /// The slow logical processors of group 0 as a mask (a lower efficiency
 /// class than the best): 0 where all cores are alike.
 pub fn slow_processors() -> usize {
