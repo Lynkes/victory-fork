@@ -8627,6 +8627,21 @@ impl Host {
                         overlay,
                         overlay_state,
                     );
+                    // The frame rate's box, as on the plain copy below (it
+                    // copies into a back buffer held as a copy's destination).
+                    if crate::fpsbox::on() {
+                        list.ResourceBarrier(&[transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_PRESENT,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )]);
+                        crate::fpsbox::draw(self, list, &back, (width, height, format));
+                        list.ResourceBarrier(&[transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_PRESENT,
+                        )]);
+                    }
                     copy.close();
                     match slot {
                         Some(i) => {
