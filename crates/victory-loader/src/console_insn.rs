@@ -496,6 +496,29 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     CONTINUE_EXECUTION
 }
 
+/// `jmp rel32` at `at` to `to`, if it reaches (from the RX 7900 XTX fork,
+/// for `descriptor_sites`).
+pub(crate) fn jump(at: usize, to: usize) -> Option<[u8; 5]> {
+    let rel = i32::try_from(to as i64 - (at as i64 + 5)).ok()?;
+    let [a, b, c, d] = rel.to_le_bytes();
+    Some([0xe9, a, b, c, d])
+}
+
+/// Bytes of code memory [`near`] makes.
+pub(crate) const STUBS_LEN: usize = 64 << 10;
+
+/// [`STUBS_LEN`] bytes of memory for code within reach of a `jmp rel32` at
+/// `at` (from the RX 7900 XTX fork).
+pub(crate) fn near(at: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
+    let at = at & !0xffff;
+    (0x10_0000..0x7000_0000).step_by(0x10_0000).flat_map(|d| [at.checked_sub(d), at.checked_add(d)]).flatten().find_map(|place| {
+        // SAFETY: reserves free memory at that address or fails.
+        let got = unsafe { VirtualAlloc(place as *const _, STUBS_LEN, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as usize;
+        (got != 0).then_some(got)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

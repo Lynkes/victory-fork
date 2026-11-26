@@ -63,6 +63,8 @@ pub mod pipeline;
 #[cfg(windows)]
 mod placed;
 #[cfg(windows)]
+pub mod port_descriptors;
+#[cfg(windows)]
 mod plaincopy;
 #[cfg(windows)]
 mod primitive;
