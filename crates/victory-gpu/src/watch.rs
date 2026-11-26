@@ -744,6 +744,11 @@ struct Guards {
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
     viewed: BTreeSet<usize>,
+    /// Blocks of [`Guards::absent`] looked at lately ([`park`]): the frame
+    /// of the look and whether the block lies in a placeholder. One in a
+    /// placeholder is not asked about again for [`park_frames`] frames
+    /// ([`parked_still`]); the others are asked at every walk, as before.
+    parked: BTreeMap<usize, (u64, bool)>,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -793,10 +798,160 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
+    parked: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a block found uncommitted inside a placeholder is "parked": not
+/// asked about again (`VirtualQuery`, [`uncommitted_end`]) at every walk
+/// over a range that covers it (`VICTORY_VIEW_PARK=1`; off by default:
+/// asked every time, as before). After pull request #812 (Peppacodes), its
+/// parked blocks alone.
+///
+/// Measured (Series S, 26 November): the write-watch askings 20 -> 11 ms a
+/// frame and the submitting thread 81 -> 74 ms, but no frame gain: the
+/// frame is then set by the title's recording threads. Off until that
+/// changes; one of its two runs lost the card (as about one run in five
+/// does without it), which says nothing either way yet.
+///
+/// The walk asked Windows about each block it had noted absent at every
+/// asking: 10 ms a frame of the submitting thread here (Series S profile,
+/// `VICTORY_PROFILE`, 26 November), nearly all of them 64 KiB placeholders,
+/// each a region of its own. A placeholder is filled only by a call that
+/// replaces it (a plain commit into one fails), and on title memory that is
+/// the runtime's mapping, which tells of itself ([`title_memory_remapped`]).
+/// The title calls Windows' own `VirtualFree` and `VirtualAlloc`, though, so
+/// a placeholder can be released and its addresses reserved again with no
+/// word to us: a parked block is looked at again after [`park_life`]
+/// frames all the same, and an ordinary reservation is never parked.
+fn view_park() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_PARK").is_some_and(|v| v == "1") && placeholders_told())
+}
+
+/// Frames a parked block goes unasked at least (`VICTORY_VIEW_PARK_FRAMES`,
+/// 30; [`park_life`]).
+fn park_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_VIEW_PARK_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(30)
+    })
+}
+
+/// Since the last frame line: walks' blocks answered as parked, questions
+/// to Windows whether absent blocks still are, and blocks looked at for
+/// parking (a placeholder or not).
+static PARK_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`PARK_STATS`], taken, and the blocks parked now.
+pub(crate) fn park_stats() -> ([u64; 3], usize) {
+    let taken = [0, 1, 2].map(|i| PARK_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let g = guards();
+    (taken, g.parked.values().filter(|p| p.1).count())
+}
+
+/// How many frames a look at `block` stands for: [`park_frames`], and as
+/// many again at most, by the block's number. Blocks parked in the same
+/// frame (some 95,000 as the world loads) are then looked at again spread
+/// over that many frames, not all in one: in one they were tens of
+/// thousands of questions in a single frame, every [`park_frames`] frames
+/// (the long frames "preparing" leads went from 72 to 111 in a run).
+fn park_life(block: usize) -> u64 {
+    let frames = park_frames();
+    frames + block as u64 % frames
+}
+
+/// Whether `block`, absent, was parked lately ([`view_park`]).
+fn parked_still(g: &Guards, block: usize) -> bool {
+    view_park()
+        && g.parked
+            .get(&block)
+            .is_some_and(|&(at, placeholder)| placeholder && crate::frame::current().saturating_sub(at) < park_life(block))
+}
+
+/// `block` was just found uncommitted: noted with the frame and whether it
+/// lies in a placeholder (asked once per [`park_frames`] frames).
+fn park(g: &mut Guards, block: usize) {
+    if !view_park() {
+        return;
+    }
+    let now = crate::frame::current();
+    if g.parked.get(&block).is_some_and(|&(at, _)| now.saturating_sub(at) < park_life(block)) {
+        return;
+    }
+    PARK_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    g.parked.insert(block, (now, in_placeholder(block)));
+}
+
+/// Whether `block` lies in a placeholder (from pull request #812).
+fn in_placeholder(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // The region's flag for a placeholder reservation, after Private,
+    // MappedDataFile, MappedImage, MappedPageFile, MappedPhysical,
+    // DirectMapped, SoftwareEnclave and PageSize64K: the SDK's header calls
+    // these bits reserved, the kernel fills them (Windows 10 1803 on). A
+    // fresh, split or unmapped-to placeholder shows it, an ordinary
+    // reservation (even one with no access) does not; `VirtualQuery` tells
+    // the two apart by nothing.
+    const PLACEHOLDER: u32 = 1 << 8;
+    // SAFETY: plain data filled in by the query.
+    let mut info: WIN32_MEMORY_REGION_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size; the returned size is
+    // optional. Free memory fails the query: no placeholder.
+    let ok = unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(),
+            (block * BLOCK) as *const _,
+            MemoryRegionInfo,
+            (&raw mut info).cast(),
+            size_of_val(&info),
+            std::ptr::null_mut(),
+        )
+    } != 0;
+    // SAFETY: the flags word of the union, filled in by the query.
+    ok && unsafe { info.Anonymous.Flags } & PLACEHOLDER != 0
+}
+
+/// Whether [`in_placeholder`] knows a placeholder, asked once of one of
+/// our own (from pull request #812). Where it does not (Wine may not fill
+/// the flag), nothing is parked.
+fn placeholders_told() -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_RELEASE, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, VirtualAlloc2, VirtualFree,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: a fresh placeholder of one block, released at once.
+    let p = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            std::ptr::null(),
+            BLOCK,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            std::ptr::null_mut(),
+            0,
+        )
+    } as usize;
+    if p == 0 {
+        return false;
+    }
+    let told = in_placeholder(p / BLOCK);
+    // SAFETY: our own placeholder, known to nothing else.
+    unsafe { VirtualFree(p as _, 0, MEM_RELEASE) };
+    if !told {
+        tracing::info!("Windows does not tell placeholders apart here: blocks found uncommitted are asked about at every walk (VICTORY_VIEW_PARK)");
+    }
+    told
 }
 
 /// Whether the block `page` is read-only by our hand and unwritten since a
@@ -861,14 +1016,26 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         for block in gap_from..=gap_to {
             let mut open = block < gap_to;
             if open && g.absent.contains(&block) {
-                // Ordinary commits need no runtime mapping notification. Reuse
-                // this asking's query for the following blocks in the same region.
-                if block >= uncommitted_until {
-                    uncommitted_until = uncommitted_end(block);
-                }
-                open = block >= uncommitted_until;
-                if open {
-                    g.absent.remove(&block);
+                if parked_still(&g, block) {
+                    // A hole in a placeholder looked at lately: only a
+                    // mapping fills it, and the runtime tells of that
+                    // ([`view_park`]).
+                    PARK_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    open = false;
+                } else {
+                    // Ordinary commits need no runtime mapping notification. Reuse
+                    // this asking's query for the following blocks in the same region.
+                    if block >= uncommitted_until {
+                        PARK_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        uncommitted_until = uncommitted_end(block);
+                    }
+                    open = block >= uncommitted_until;
+                    if open {
+                        g.absent.remove(&block);
+                        g.parked.remove(&block);
+                    } else {
+                        park(&mut g, block);
+                    }
                 }
             }
             if open {
@@ -1082,6 +1249,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             let error = std::io::Error::last_os_error();
             if block < uncommitted_end(block) {
                 g.absent.insert(block);
+                park(g, block);
             } else {
                 // Diagnostics: a committed block that will not be made
                 // read-only is reported written at every asking and never
@@ -1360,6 +1528,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let absent: Vec<usize> = g.absent.range(r_from..r_to).copied().collect();
     for block in absent {
         g.absent.remove(&block);
+    }
+    // Nor parked ([`view_park`]): mapped, or about to be a hole again.
+    let parked: Vec<usize> = g.parked.range(r_from..r_to).map(|(&block, _)| block).collect();
+    for block in parked {
+        g.parked.remove(&block);
     }
     g.protected.remove_range(r_from, r_to);
     g.clean.remove_range(r_from, r_to);
@@ -1732,6 +1905,33 @@ mod tests {
         title_memory_remapped(p, 3 * BLOCK);
     }
 
+    /// With parking (`view_park`), holes in an ordinary reservation are
+    /// not parked: a commit no one tells of (the title calls Windows' own
+    /// `VirtualAlloc`) is found at the next asking, as before.
+    #[test]
+    fn holes_in_an_ordinary_reservation_are_not_parked() {
+        // SAFETY: a fresh reservation of two blocks, nothing committed.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let pages = |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE;
+        let all: Vec<usize> = (0..2).flat_map(pages).collect();
+        // Nothing there: a view, its blocks reported once.
+        assert_eq!(guard(p, p + 2 * BLOCK), Some(all));
+        assert_eq!(guard(p, p + 2 * BLOCK), Some(Vec::new()));
+        if view_park() {
+            let g = guards();
+            assert!(g.parked.get(&(p / BLOCK)).is_some_and(|&(_, placeholder)| !placeholder), "looked at, no placeholder");
+        }
+        // SAFETY: the first block of our reservation, committed with no
+        // word to the guards.
+        assert_eq!(unsafe { VirtualAlloc(p as _, BLOCK, MEM_COMMIT, PAGE_READWRITE) } as usize, p);
+        assert_eq!(guard(p, p + 2 * BLOCK), Some(pages(0).collect()));
+        assert_eq!(guard(p, p + 2 * BLOCK), Some(Vec::new()));
+        title_memory_remapped(p, 2 * BLOCK);
+        // SAFETY: our reservation, no longer known to the guards.
+        unsafe { VirtualFree(p as _, 0, MEM_RELEASE) };
+    }
+
     /// Blocks of a placeholder between views are reported once, then not
     /// again (they cannot be guarded) until the runtime maps them.
     #[test]
@@ -1800,8 +2000,15 @@ mod tests {
             Some(Vec::new()),
             "nothing written since"
         );
+        let parked_as_placeholder = |block: usize| guards().parked.get(&block).is_some_and(|&(_, placeholder)| placeholder);
+        if view_park() {
+            // Holes in the placeholder: parked, not asked about again
+            // until the runtime maps them.
+            assert!(parked_as_placeholder(p / BLOCK + 1) && parked_as_placeholder(p / BLOCK + 2));
+        }
         let second = map(1);
         title_memory_remapped(p + BLOCK, BLOCK);
+        assert!(!guards().parked.contains_key(&(p / BLOCK + 1)), "mapped: no longer parked");
         assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
         assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
         // SAFETY: our views and placeholder.

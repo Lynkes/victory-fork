@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 static TENTHS: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Whether the counter is drawn.
-fn on() -> bool {
+pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FPS_COUNTER").is_none_or(|v| v != "0"))
 }
